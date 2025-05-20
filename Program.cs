@@ -3,6 +3,7 @@ using System;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
+using System.IO.Pipelines;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -12,14 +13,17 @@ namespace rtspclock
     {
         private static void Main(string[] args)
         {
-            var libVLC = new LibVLC(enableDebugLogs: true);
+            var libVLC = new LibVLC(true, "--demux=mjpeg");
             libVLC.Log += (obj, eventArgs) =>
             {
                 Console.WriteLine("libVLC: " + eventArgs.Message);
             };
 
+            var pipe = new Pipe();
+            var mediaInput = new PipeMediaInput(pipe.Reader);
+
             var stream = new MemoryStream();
-            var streamMediaInput = new StreamMediaInput(stream);
+            var streamToMemory = new StreamToMemory(stream);
 
             int width = 1920;
             int height = 1024;
@@ -33,18 +37,34 @@ namespace rtspclock
             var brush = new SolidBrush(Color.White);
             var padding = new Rectangle(0, 0, width, height);
 
-            Task.Run(() =>
+            Task.Run(async () =>
             {
+                var interval = TimeSpan.FromMilliseconds(1000);
+
                 while (true)
                 {
                     graphics.Clear(Color.DarkGray);
 
-                    var dt = DateTime.Now.ToString("yyyy-MM-dd\nhh:mm:ss.fff");
+                    var now = DateTime.Now;
+                    var dt = now.ToString("hh:mm:ss.fff\nyyyy-MM-dd");
                     graphics.DrawString(dt, font, brush, padding, strFormat);
 
                     bitmap.Save(stream, ImageFormat.Jpeg);
+                    var length = stream.Position;
+                    Memory<byte> memory = pipe.Writer.GetMemory((int)length);
 
-                    Thread.Sleep(500);
+                    int bytesRead = streamToMemory.Copy(ref memory, (int)length);
+
+                    pipe.Writer.Advance(bytesRead);
+                    await pipe.Writer.FlushAsync();
+
+                    stream.SetLength(0);
+
+                    var duration = DateTime.Now - now;
+                    var sleep = interval - duration;
+
+                    if (sleep.TotalMilliseconds > 0)
+                        Thread.Sleep(sleep);
                 }
             });
 
@@ -64,7 +84,7 @@ namespace rtspclock
                 ":sout-keep",
             };
 
-            var media = new Media(libVLC, streamMediaInput, options);
+            var media = new Media(libVLC, mediaInput, options);
 
             player.Play(media);
 
